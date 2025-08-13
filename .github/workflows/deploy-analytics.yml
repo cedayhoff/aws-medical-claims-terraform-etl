@@ -1,0 +1,161 @@
+name: Deploy Analytics Views
+
+on:
+  push:
+    branches: [main, master]
+    paths: 
+      - 'sql/views/**'
+      - 'terraform/analytics_views.tf'
+      - 'scripts/deployment/**'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'sql/views/**'
+      - 'terraform/analytics_views.tf'
+
+env:
+  AWS_REGION: us-east-2
+  TERRAFORM_VERSION: '1.0'
+
+jobs:
+  validate-sql:
+    name: Validate SQL Syntax
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Validate SQL files
+        run: |
+          echo "Validating SQL syntax..."
+          
+          # Basic SQL syntax validation
+          for sql_file in sql/views/*.sql; do
+            if [ -f "$sql_file" ]; then
+              echo "Checking $sql_file..."
+              
+              # Check for basic SQL syntax issues
+              if grep -q "CREATE OR REPLACE VIEW" "$sql_file"; then
+                echo "$sql_file: Valid CREATE VIEW statement"
+              else
+                echo "$sql_file: Missing CREATE VIEW statement"
+                exit 1
+              fi
+              
+              # Check for common SQL issues
+              if grep -qi "select.*from.*;" "$sql_file"; then
+                echo "$sql_file: Contains valid SELECT statement"
+              else
+                echo "$sql_file: No valid SELECT statement found"
+                exit 1
+              fi
+            fi
+          done
+          
+          echo "🎉 All SQL files validated successfully"
+
+  deploy-dev:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    needs: validate-sql
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    environment: development
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init
+          
+      - name: Deploy Infrastructure Changes
+        run: |
+          cd terraform
+          terraform plan -var="environment=dev" -var="aws_region=${{ env.AWS_REGION }}"
+          terraform apply -var="environment=dev" -var="aws_region=${{ env.AWS_REGION }}" -auto-approve
+          
+      - name: Deploy Analytics Views
+        run: |
+          chmod +x scripts/deployment/deploy-views.sh
+          ./scripts/deployment/deploy-views.sh dev ${{ env.AWS_REGION }}
+          
+      - name: Validate Deployment
+        run: |
+          echo "Validating analytics views deployment..."
+          
+          # Test key views
+          aws athena start-query-execution \
+            --region ${{ env.AWS_REGION }} \
+            --work-group medclaims-dev-workgroup \
+            --query-execution-context Database=medclaims-dev_db \
+            --result-configuration OutputLocation=s3://medclaims-dev-glue-assets/athena-results/ci-validation/ \
+            --query-string "SELECT 'deployment_validation' as test, COUNT(*) as record_count FROM executive_dashboard"
+            
+          echo "Deployment validation completed"
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    environment: staging
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_STAGING }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Deploy Analytics Views to Staging
+        run: |
+          chmod +x scripts/deployment/deploy-views.sh
+          ./scripts/deployment/deploy-views.sh staging ${{ env.AWS_REGION }}
+
+  # Production deployment (manual approval required)
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Deploy Analytics Views to Production
+        run: |
+          chmod +x scripts/deployment/deploy-views.sh
+          ./scripts/deployment/deploy-views.sh prod ${{ env.AWS_REGION }}
+          
+      - name: Notify Deployment Success
+        run: |
+          echo "🎉 Production deployment completed successfully!"
+          echo "📊 Analytics views are now available in production"
+          echo "🔗 Athena Console: https://${{ env.AWS_REGION }}.console.aws.amazon.com/athena/"

@@ -1,0 +1,168 @@
+{
+  "Comment": "Medical Claims Dimensional ETL Pipeline - Assessment Version",
+  "StartAt": "PreETLValidation",
+  "States": {
+    "PreETLValidation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${data_quality_lambda_arn}",
+        "Payload": {
+          "stage": "pre-etl",
+          "bucket": "${raw_data_bucket}"
+        }
+      },
+      "ResultPath": "$.preETLValidation",
+      "Next": "CheckRawDataQuality",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "ETLFailure",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    
+    "CheckRawDataQuality": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.preETLValidation.Payload.body",
+          "StringMatches": "*\"overall_status\": \"PASS\"*",
+          "Next": "ProcessRawDataDimensional"
+        },
+        {
+          "Variable": "$.preETLValidation.Payload.body",
+          "StringMatches": "*\"overall_status\": \"WARN\"*",
+          "Next": "ProcessRawDataDimensional"
+        }
+      ],
+      "Default": "DataQualityFailure"
+    },
+    
+    "ProcessRawDataDimensional": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${raw_processor_job_name}",
+        "Arguments": {
+          "--SOURCE_BUCKET": "${raw_data_bucket}",
+          "--TARGET_BUCKET": "${processed_data_bucket}"
+        }
+      },
+      "ResultPath": "$.rawProcessing",
+      "Next": "CreateDimensionalModel",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "ETLFailure",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    
+    "CreateDimensionalModel": {
+      "Type": "Task", 
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${dimensional_processor_job_name}",
+        "Arguments": {
+          "--SOURCE_BUCKET": "${processed_data_bucket}",
+          "--TARGET_BUCKET": "${curated_data_bucket}"
+        }
+      },
+      "ResultPath": "$.dimensionalProcessing",
+      "Next": "PostETLValidation",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "ETLFailure", 
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    
+    "PostETLValidation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${data_quality_lambda_arn}",
+        "Payload": {
+          "stage": "post-etl",
+          "bucket": "${curated_data_bucket}",
+          "dimensional_check": true
+        }
+      },
+      "ResultPath": "$.postETLValidation",
+      "Next": "CheckFinalDataQuality",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "ETLFailure",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    
+    "CheckFinalDataQuality": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.postETLValidation.Payload.body",
+          "StringMatches": "*\"overall_status\": \"PASS\"*",
+          "Next": "GenerateETLSummary"
+        },
+        {
+          "Variable": "$.postETLValidation.Payload.body",
+          "StringMatches": "*\"overall_status\": \"WARN\"*",
+          "Next": "GenerateETLSummary"
+        }
+      ],
+      "Default": "DataQualityFailure"
+    },
+    
+    "GenerateETLSummary": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${data_quality_lambda_arn}",
+        "Payload": {
+          "stage": "summary-report",
+          "raw_processing": "$.rawProcessing",
+          "dimensional_processing": "$.dimensionalProcessing",
+          "pre_validation": "$.preETLValidation.Payload",
+          "post_validation": "$.postETLValidation.Payload"
+        }
+      },
+      "ResultPath": "$.summary",
+      "Next": "ETLSuccess"
+    },
+    
+    "ETLSuccess": {
+      "Type": "Pass",
+      "Result": {
+        "status": "SUCCESS",
+        "message": "Dimensional ETL pipeline completed successfully. Data is available in S3 curated layer for Athena querying."
+      },
+      "End": true
+    },
+    
+    "DataQualityFailure": {
+      "Type": "Pass",
+      "Result": {
+        "status": "FAILED",
+        "message": "ETL pipeline failed due to data quality issues. Check CloudWatch logs for details."
+      },
+      "End": true
+    },
+    
+    "ETLFailure": {
+      "Type": "Pass",
+      "Result": {
+        "status": "FAILED", 
+        "message": "ETL pipeline failed during processing. Check CloudWatch logs for details."
+      },
+      "End": true
+    }
+  }
+}
